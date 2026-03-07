@@ -29,6 +29,7 @@ jobs:
       - name: Build frontend
         working-directory: interface
         run: |
+          rm -f package-lock.json
           bun install
           bun run build
 
