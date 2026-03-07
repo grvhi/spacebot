@@ -29,9 +29,9 @@ jobs:
       - name: Build frontend
         working-directory: interface
         run: |
-          rm -f package-lock.json
-          bun install
-          bun run build
+          rm -f package-lock.json bun.lock bun.lockb
+          npm install
+          npx vite build
 
       - name: Build binary
         run: cargo build --release
