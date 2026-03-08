@@ -26,6 +26,14 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build OpenCode embed
+        run: ./scripts/build-opencode-embed.sh
+
       - name: Build frontend
         working-directory: interface
         run: |
