@@ -2,9 +2,9 @@
 
 use super::state::ApiState;
 use super::{
-    agents, bindings, channels, config, cortex, cron, ingest, links, mcp, memories, messaging,
-    models, opencode_proxy, projects, providers, secrets, settings, skills, system, tasks, tools,
-    webchat, workers,
+    agents, bindings, channels, config, cortex, cron, factory, ingest, links, mcp, memories,
+    messaging, models, opencode_proxy, projects, providers, secrets, settings, skills, system,
+    tasks, tools, webchat, workers,
 };
 
 use axum::Json;
@@ -107,8 +107,19 @@ pub async fn start_http_server(
         )
         .route("/cortex/events", get(cortex::cortex_events))
         .route("/cortex-chat/messages", get(cortex::cortex_chat_messages))
+        .route("/cortex-chat/threads", get(cortex::cortex_chat_threads))
+        .route(
+            "/cortex-chat/thread",
+            delete(cortex::cortex_chat_delete_thread),
+        )
         .route("/cortex-chat/send", post(cortex::cortex_chat_send))
         .route("/agents/profile", get(agents::get_agent_profile))
+        .route(
+            "/agents/avatar",
+            get(agents::get_avatar)
+                .post(agents::upload_avatar)
+                .delete(agents::delete_avatar),
+        )
         .route(
             "/agents/identity",
             get(agents::get_identity).put(agents::update_identity),
@@ -173,7 +184,9 @@ pub async fn start_http_server(
         )
         .route("/agents/ingest/upload", post(ingest::upload_ingest_file))
         .route("/agents/skills", get(skills::list_skills))
+        .route("/agents/skills/content", get(skills::get_skill_content))
         .route("/agents/skills/install", post(skills::install_skill))
+        .route("/agents/skills/upload", post(skills::upload_skill))
         .route("/agents/skills/remove", delete(skills::remove_skill))
         .route("/agents/tools", get(tools::list_tools))
         // Secret store management
@@ -193,6 +206,10 @@ pub async fn start_http_server(
         .route("/secrets/import", post(secrets::import_secrets))
         .route("/skills/registry/browse", get(skills::registry_browse))
         .route("/skills/registry/search", get(skills::registry_search))
+        .route(
+            "/skills/registry/content",
+            get(skills::registry_skill_content),
+        )
         .route(
             "/providers",
             get(providers::get_providers).put(providers::update_provider),
@@ -259,6 +276,9 @@ pub async fn start_http_server(
             "/humans/{id}",
             put(links::update_human).delete(links::delete_human),
         )
+        // Factory: preset archetypes
+        .route("/factory/presets", get(factory::list_presets))
+        .route("/factory/presets/{id}", get(factory::get_preset))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),

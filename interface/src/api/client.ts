@@ -153,6 +153,14 @@ export interface WorkerTextEvent {
 	text: string;
 }
 
+export interface CortexChatMessageEvent {
+	type: "cortex_chat_message";
+	agent_id: string;
+	thread_id: string;
+	content: string;
+	tool_calls?: CortexChatToolCall[];
+}
+
 export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
@@ -167,7 +175,8 @@ export type ApiEvent =
 	| ToolStartedEvent
 	| ToolCompletedEvent
 	| OpenCodePartUpdatedEvent
-	| WorkerTextEvent;
+	| WorkerTextEvent
+	| CortexChatMessageEvent;
 
 async function fetchJson<T>(path: string): Promise<T> {
 	const response = await fetch(`${API_BASE}${path}`);
@@ -299,6 +308,8 @@ export interface AgentInfo {
 	id: string;
 	display_name?: string;
 	role?: string;
+	gradient_start?: string;
+	gradient_end?: string;
 	workspace: string;
 	context_window: number;
 	max_turns: number;
@@ -529,6 +540,14 @@ export interface CortexEventsParams {
 
 // -- Cortex Chat --
 
+export interface CortexChatToolCall {
+	id: string;
+	tool: string;
+	args: string;
+	result: string | null;
+	status: "running" | "completed" | "error";
+}
+
 export interface CortexChatMessage {
 	id: string;
 	thread_id: string;
@@ -536,6 +555,7 @@ export interface CortexChatMessage {
 	content: string;
 	channel_context: string | null;
 	created_at: string;
+	tool_calls?: CortexChatToolCall[];
 }
 
 export interface CortexChatMessagesResponse {
@@ -543,22 +563,56 @@ export interface CortexChatMessagesResponse {
 	thread_id: string;
 }
 
+export interface CortexChatThread {
+	thread_id: string;
+	preview: string;
+	message_count: number;
+	first_message_at: string;
+	last_message_at: string;
+}
+
+export interface CortexChatThreadsResponse {
+	threads: CortexChatThread[];
+}
+
 export type CortexChatSSEEvent =
 	| { type: "thinking" }
-	| { type: "done"; full_text: string }
+	| { type: "tool_started"; tool: string; call_id: string; args: string }
+	| { type: "tool_completed"; tool: string; call_id: string; args: string; result: string; result_preview: string }
+	| { type: "done"; full_text: string; tool_calls: CortexChatToolCall[] }
 	| { type: "error"; message: string };
+
+// -- Factory Presets --
+
+export interface PresetDefaults {
+	max_concurrent_workers: number | null;
+	max_turns: number | null;
+}
+
+export interface PresetMeta {
+	id: string;
+	name: string;
+	description: string;
+	icon: string;
+	tags: string[];
+	defaults: PresetDefaults;
+}
+
+export interface PresetsResponse {
+	presets: PresetMeta[];
+}
 
 export interface IdentityFiles {
 	soul: string | null;
 	identity: string | null;
-	user: string | null;
+	role: string | null;
 }
 
 export interface IdentityUpdateRequest {
 	agent_id: string;
 	soul?: string | null;
 	identity?: string | null;
-	user?: string | null;
+	role?: string | null;
 }
 
 // -- Agent Config Types --
@@ -974,6 +1028,26 @@ export interface RegistrySearchResponse {
 	count: number;
 }
 
+export interface SkillContentResponse {
+	name: string;
+	description: string;
+	content: string;
+	file_path: string;
+	base_dir: string;
+	source: string;
+	source_repo?: string;
+}
+
+export interface UploadSkillResponse {
+	installed: string[];
+}
+
+export interface RegistrySkillContentResponse {
+	source: string;
+	skill_id: string;
+	content: string | null;
+}
+
 // -- Task Types --
 
 export type TaskStatus = "pending_approval" | "backlog" | "ready" | "in_progress" | "done";
@@ -1297,6 +1371,11 @@ export interface TopologyHuman {
 	display_name?: string;
 	role?: string;
 	bio?: string;
+	description?: string;
+	discord_id?: string;
+	telegram_id?: string;
+	slack_id?: string;
+	email?: string;
 }
 
 export interface TopologyResponse {
@@ -1311,12 +1390,22 @@ export interface CreateHumanRequest {
 	display_name?: string;
 	role?: string;
 	bio?: string;
+	description?: string;
+	discord_id?: string;
+	telegram_id?: string;
+	slack_id?: string;
+	email?: string;
 }
 
 export interface UpdateHumanRequest {
 	display_name?: string;
 	role?: string;
 	bio?: string;
+	description?: string;
+	discord_id?: string;
+	telegram_id?: string;
+	slack_id?: string;
+	email?: string;
 }
 
 export interface CreateGroupRequest {
@@ -1529,6 +1618,7 @@ export const api = {
 	status: () => fetchJson<StatusResponse>("/status"),
 	overview: () => fetchJson<InstanceOverviewResponse>("/overview"),
 	agents: () => fetchJson<AgentsResponse>("/agents"),
+	factoryPresets: () => fetchJson<PresetsResponse>("/factory/presets"),
 	agentOverview: (agentId: string) =>
 		fetchJson<AgentOverviewResponse>(`/agents/overview?agent_id=${encodeURIComponent(agentId)}`),
 	channels: () => fetchJson<ChannelsResponse>("/channels"),
@@ -1604,6 +1694,18 @@ export const api = {
 				channel_id: channelId ?? null,
 			}),
 		}),
+	cortexChatThreads: (agentId: string) =>
+		fetchJson<CortexChatThreadsResponse>(
+			`/cortex-chat/threads?agent_id=${encodeURIComponent(agentId)}`,
+		),
+	cortexChatDeleteThread: async (agentId: string, threadId: string) => {
+		const response = await fetch(`${API_BASE}/cortex-chat/thread`, {
+			method: "DELETE",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ agent_id: agentId, thread_id: threadId }),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	},
 	agentProfile: (agentId: string) =>
 		fetchJson<AgentProfileResponse>(`/agents/profile?agent_id=${encodeURIComponent(agentId)}`),
 	agentIdentity: (agentId: string) =>
@@ -1631,7 +1733,7 @@ export const api = {
 		return response.json() as Promise<{ success: boolean; agent_id: string; message: string }>;
 	},
 
-	updateAgent: async (agentId: string, update: { display_name?: string; role?: string }) => {
+	updateAgent: async (agentId: string, update: { display_name?: string; role?: string; gradient_start?: string; gradient_end?: string }) => {
 		const response = await fetch(`${API_BASE}/agents`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
@@ -1646,6 +1748,35 @@ export const api = {
 	deleteAgent: async (agentId: string) => {
 		const params = new URLSearchParams({ agent_id: agentId });
 		const response = await fetch(`${API_BASE}/agents?${params}`, {
+			method: "DELETE",
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{ success: boolean; message: string }>;
+	},
+
+	/** Get the avatar URL for an agent (returns the raw URL, not fetched). */
+	agentAvatarUrl: (agentId: string) => `${API_BASE}/agents/avatar?agent_id=${encodeURIComponent(agentId)}`,
+
+	/** Upload an avatar image for an agent. */
+	uploadAvatar: async (agentId: string, file: File) => {
+		const params = new URLSearchParams({ agent_id: agentId });
+		const response = await fetch(`${API_BASE}/agents/avatar?${params}`, {
+			method: "POST",
+			headers: { "Content-Type": file.type },
+			body: file,
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{ success: boolean; path?: string; message?: string }>;
+	},
+
+	/** Delete the avatar for an agent. */
+	deleteAvatar: async (agentId: string) => {
+		const params = new URLSearchParams({ agent_id: agentId });
+		const response = await fetch(`${API_BASE}/agents/avatar?${params}`, {
 			method: "DELETE",
 		});
 		if (!response.ok) {
@@ -2020,6 +2151,26 @@ export const api = {
 		return response.json() as Promise<RemoveSkillResponse>;
 	},
 
+	getSkillContent: (agentId: string, name: string) =>
+		fetchJson<SkillContentResponse>(
+			`/agents/skills/content?agent_id=${encodeURIComponent(agentId)}&name=${encodeURIComponent(name)}`,
+		),
+
+	uploadSkillFiles: async (agentId: string, files: File[]) => {
+		const form = new FormData();
+		for (const file of files) {
+			form.append("file", file);
+		}
+		const response = await fetch(
+			`${API_BASE}/agents/skills/upload?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "POST", body: form },
+		);
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<UploadSkillResponse>;
+	},
+
 	// Skills Registry API (skills.sh proxy)
 	registryBrowse: (view: RegistryView = "all-time", page = 0) =>
 		fetchJson<RegistryBrowseResponse>(
@@ -2029,6 +2180,11 @@ export const api = {
 	registrySearch: (query: string, limit = 50) =>
 		fetchJson<RegistrySearchResponse>(
 			`/skills/registry/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+		),
+
+	registrySkillContent: (source: string, skillId: string) =>
+		fetchJson<RegistrySkillContentResponse>(
+			`/skills/registry/content?source=${encodeURIComponent(source)}&skill_id=${encodeURIComponent(skillId)}`,
 		),
 
 	// Agent Links & Topology API
