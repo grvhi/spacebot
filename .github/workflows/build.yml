@@ -1,6 +1,8 @@
 name: Build & Release (with UI)
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -22,7 +24,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('**/Cargo.toml') }}
-   
+
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
@@ -51,6 +53,19 @@ jobs:
           mkdir -p dist
           cp target/release/spacebot dist/spacebot
           tar -czvf dist/spacebot-${VERSION}-x86_64-unknown-linux-gnu.tar.gz -C dist spacebot
+
+      - name: Clean old release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/latest-build --jq '.id' 2>/dev/null || echo "")
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Cleaning old assets from release $RELEASE_ID..."
+            gh api repos/${{ github.repository }}/releases/$RELEASE_ID/assets --jq '.[].id' | while read ASSET_ID; do
+              echo "Deleting asset $ASSET_ID"
+              gh api -X DELETE repos/${{ github.repository }}/releases/$RELEASE_ID/assets/$ASSET_ID
+            done
+          fi
 
       - name: Create/update rolling release
         uses: softprops/action-gh-release@v2
