@@ -1,8 +1,6 @@
 name: Build & Release (with UI)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -22,7 +20,9 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
-
+        with:
+          key: ${{ hashFiles('**/Cargo.toml') }}
+   
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
