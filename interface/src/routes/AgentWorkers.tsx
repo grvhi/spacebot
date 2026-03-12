@@ -38,19 +38,6 @@ function normalizeStatus(status: string): string {
 	return "failed";
 }
 
-function statusBadgeVariant(status: string) {
-	switch (status) {
-		case "running":
-			return "amber" as const;
-		case "idle":
-			return "blue" as const;
-		case "failed":
-			return "red" as const;
-		default:
-			return "outline" as const;
-	}
-}
-
 function durationBetween(start: string, end: string | null): string {
 	if (!end) return "";
 	const seconds = Math.floor(
