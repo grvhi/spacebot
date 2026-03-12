@@ -269,6 +269,7 @@ pub struct LlmConfig {
     pub minimax_cn_key: Option<String>,
     pub moonshot_key: Option<String>,
     pub zai_coding_plan_key: Option<String>,
+    pub github_copilot_key: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -340,6 +341,10 @@ impl std::fmt::Debug for LlmConfig {
                 "zai_coding_plan_key",
                 &self.zai_coding_plan_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "github_copilot_key",
+                &self.github_copilot_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("providers", &self.providers)
             .finish()
     }
@@ -369,6 +374,7 @@ impl LlmConfig {
             || self.minimax_cn_key.is_some()
             || self.moonshot_key.is_some()
             || self.zai_coding_plan_key.is_some()
+            || self.github_copilot_key.is_some()
             || !self.providers.is_empty()
     }
 }
@@ -498,6 +504,11 @@ impl SystemSecrets for LlmConfig {
             SecretField {
                 toml_key: "sambanova_key",
                 secret_name: "SAMBANOVA_API_KEY",
+                instance_pattern: None,
+            },
+            SecretField {
+                toml_key: "github_copilot_key",
+                secret_name: "GITHUB_COPILOT_API_KEY",
                 instance_pattern: None,
             },
         ]
@@ -841,6 +852,16 @@ pub struct CortexConfig {
     pub bulletin_max_words: usize,
     /// Max LLM turns for bulletin generation.
     pub bulletin_max_turns: usize,
+    /// Interval in seconds between memory maintenance passes.
+    pub maintenance_interval_secs: u64,
+    /// Per-day decay applied to memory importance during maintenance.
+    pub maintenance_decay_rate: f32,
+    /// Minimum importance score for non-identity memories to avoid pruning.
+    pub maintenance_prune_threshold: f32,
+    /// Minimum age in days before a memory becomes prune-eligible.
+    pub maintenance_min_age_days: i64,
+    /// Similarity threshold above which memories are merged as near-duplicates.
+    pub maintenance_merge_similarity_threshold: f32,
     /// Interval in seconds between association passes.
     pub association_interval_secs: u64,
     /// Minimum cosine similarity to create a RelatedTo edge.
@@ -863,12 +884,55 @@ impl Default for CortexConfig {
             bulletin_interval_secs: 3600,
             bulletin_max_words: 1500,
             bulletin_max_turns: 15,
+            maintenance_interval_secs: 3600,
+            maintenance_decay_rate: 0.05,
+            maintenance_prune_threshold: 0.1,
+            maintenance_min_age_days: 30,
+            maintenance_merge_similarity_threshold: 0.95,
             association_interval_secs: 300,
             association_similarity_threshold: 0.85,
             association_updates_threshold: 0.95,
             association_max_per_pass: 100,
         }
     }
+}
+
+impl CortexConfig {
+    /// Validate maintenance tuning bounds used by pruning/merge logic.
+    pub fn validate_maintenance_bounds(&self) -> Result<()> {
+        validate_unit_interval_f32("maintenance_decay_rate", self.maintenance_decay_rate)?;
+        validate_unit_interval_f32(
+            "maintenance_prune_threshold",
+            self.maintenance_prune_threshold,
+        )?;
+        validate_unit_interval_f32(
+            "maintenance_merge_similarity_threshold",
+            self.maintenance_merge_similarity_threshold,
+        )?;
+        if self.maintenance_min_age_days < 0 {
+            return Err(ConfigError::Invalid(format!(
+                "maintenance_min_age_days must be >= 0, got {}",
+                self.maintenance_min_age_days
+            ))
+            .into());
+        }
+        if self.maintenance_interval_secs == 0 {
+            return Err(
+                ConfigError::Invalid("maintenance_interval_secs must be >= 1".to_string()).into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_unit_interval_f32(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be finite and between 0.0 and 1.0, got {value}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Warmup configuration.
@@ -1408,7 +1472,7 @@ pub struct Binding {
     pub adapter: Option<String>,
     pub guild_id: Option<String>,
     pub workspace_id: Option<String>, // Slack workspace (team) ID
-    pub chat_id: Option<String>,
+    pub chat_id: Option<String>,      // Telegram group ID
     /// Channel IDs this binding applies to. If empty, all channels in the guild/workspace are allowed.
     pub channel_ids: Vec<String>,
     /// Require explicit @mention (or reply-to-bot) for inbound messages.
@@ -1606,7 +1670,7 @@ pub(super) struct AdapterValidationState {
 pub(super) fn is_named_adapter_platform(platform: &str) -> bool {
     matches!(
         platform,
-        "discord" | "slack" | "telegram" | "twitch" | "email"
+        "discord" | "slack" | "telegram" | "twitch" | "email" | "signal"
     )
 }
 
@@ -1769,6 +1833,26 @@ pub(super) fn build_adapter_validation_states(
         );
     }
 
+    if let Some(signal) = &messaging.signal {
+        let named_instances = validate_instance_names(
+            "signal",
+            signal
+                .instances
+                .iter()
+                .map(|instance| instance.name.as_str()),
+        )?;
+        let default_present =
+            !signal.http_url.trim().is_empty() && !signal.account.trim().is_empty();
+        validate_runtime_keys("signal", default_present, &named_instances)?;
+        states.insert(
+            "signal",
+            AdapterValidationState {
+                default_present,
+                named_instances,
+            },
+        );
+    }
+
     Ok(states)
 }
 
@@ -1889,6 +1973,7 @@ pub struct MessagingConfig {
     pub email: Option<EmailConfig>,
     pub webhook: Option<WebhookConfig>,
     pub twitch: Option<TwitchConfig>,
+    pub signal: Option<SignalConfig>,
 }
 
 #[derive(Clone)]
@@ -2381,4 +2466,103 @@ pub struct WebhookConfig {
     pub port: u16,
     pub bind: String,
     pub auth_token: Option<String>,
+}
+
+/// Signal messaging via signal-cli JSON-RPC daemon.
+///
+/// Connects to a running `signal-cli daemon --http` instance for sending and
+/// receiving Signal messages. Supports both direct messages and group chats.
+#[derive(Clone)]
+pub struct SignalConfig {
+    pub enabled: bool,
+    /// Base URL of the signal-cli JSON-RPC HTTP daemon (e.g. `http://127.0.0.1:8686`).
+    /// May contain embedded credentials which are redacted in debug output.
+    pub http_url: String,
+    /// E.164 phone number of the bot's Signal account (e.g. `+1234567890`).
+    pub account: String,
+    /// Additional named Signal adapter instances.
+    pub instances: Vec<SignalInstanceConfig>,
+    /// Phone numbers or UUIDs allowed to DM the bot. If empty, DMs are ignored.
+    pub dm_allowed_users: Vec<String>,
+    /// Group IDs allowed for this adapter. If empty, all groups are blocked
+    /// (same as `None` in the permission filter — groups are opt-in only).
+    pub group_ids: Vec<String>,
+    /// User IDs allowed to message in Signal groups.
+    pub group_allowed_users: Vec<String>,
+    /// Whether to silently drop story messages (default: true).
+    pub ignore_stories: bool,
+}
+
+/// Per-instance config for a named Signal adapter.
+#[derive(Clone)]
+pub struct SignalInstanceConfig {
+    pub name: String,
+    pub enabled: bool,
+    /// Base URL of this instance's signal-cli daemon.
+    pub http_url: String,
+    /// E.164 phone number for this instance's Signal account.
+    pub account: String,
+    /// Phone numbers or UUIDs allowed to DM this instance.
+    pub dm_allowed_users: Vec<String>,
+    /// Group IDs allowed for this instance.
+    pub group_ids: Vec<String>,
+    /// User IDs allowed to message in Signal groups for this instance.
+    pub group_allowed_users: Vec<String>,
+    /// Whether this instance drops story messages.
+    pub ignore_stories: bool,
+}
+
+impl std::fmt::Debug for SignalInstanceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalInstanceConfig")
+            .field("name", &self.name)
+            .field("enabled", &self.enabled)
+            .field("http_url", &"[REDACTED]")
+            .field("account", &"[REDACTED]")
+            .field("dm_allowed_users", &"[REDACTED]")
+            .field("group_ids", &self.group_ids)
+            .field("group_allowed_users", &"[REDACTED]")
+            .field("ignore_stories", &self.ignore_stories)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SignalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalConfig")
+            .field("enabled", &self.enabled)
+            .field("http_url", &"[REDACTED]")
+            .field("account", &"[REDACTED]")
+            .field("instances", &self.instances)
+            .field("dm_allowed_users", &"[REDACTED]")
+            .field("group_ids", &self.group_ids)
+            .field("group_allowed_users", &"[REDACTED]")
+            .field("ignore_stories", &self.ignore_stories)
+            .finish()
+    }
+}
+
+impl SystemSecrets for SignalConfig {
+    fn section() -> &'static str {
+        "signal"
+    }
+
+    fn is_messaging_adapter() -> bool {
+        true
+    }
+
+    fn secret_fields() -> &'static [SecretField] {
+        &[
+            SecretField {
+                toml_key: "http_url",
+                secret_name: "SIGNAL_HTTP_URL",
+                instance_pattern: None,
+            },
+            SecretField {
+                toml_key: "account",
+                secret_name: "SIGNAL_ACCOUNT",
+                instance_pattern: None,
+            },
+        ]
+    }
 }

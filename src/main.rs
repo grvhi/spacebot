@@ -179,10 +179,6 @@ enum SecretsCommand {
 /// Tracks an active conversation channel and its message sender.
 struct ActiveChannel {
     message_tx: mpsc::Sender<spacebot::InboundMessage>,
-    /// Latest inbound message for this conversation, shared with the outbound
-    /// routing task so status updates (e.g. typing indicators) target the
-    /// most recent message rather than the first one the channel ever received.
-    latest_message: Arc<tokio::sync::RwLock<spacebot::InboundMessage>>,
     /// Retained so the outbound routing task stays alive.
     _outbound_handle: tokio::task::JoinHandle<()>,
 }
@@ -268,6 +264,68 @@ fn render_conversation_history_backfill(
         .collect();
 
     serialize_backfill_transcript(entries)
+}
+
+/// Forward outbound response events to SSE clients for the dashboard.
+fn forward_sse_event(
+    api_event_tx: &tokio::sync::broadcast::Sender<spacebot::api::ApiEvent>,
+    agent_id: &str,
+    channel_id: &str,
+    response: &spacebot::OutboundResponse,
+) {
+    match response {
+        spacebot::OutboundResponse::Text(text)
+        | spacebot::OutboundResponse::RichMessage { text, .. }
+        | spacebot::OutboundResponse::ThreadReply { text, .. } => {
+            api_event_tx
+                .send(spacebot::api::ApiEvent::OutboundMessage {
+                    agent_id: agent_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                    text: text.clone(),
+                })
+                .ok();
+        }
+        spacebot::OutboundResponse::Status(spacebot::StatusUpdate::Thinking) => {
+            api_event_tx
+                .send(spacebot::api::ApiEvent::TypingState {
+                    agent_id: agent_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                    is_typing: true,
+                })
+                .ok();
+        }
+        spacebot::OutboundResponse::Status(spacebot::StatusUpdate::StopTyping) => {
+            api_event_tx
+                .send(spacebot::api::ApiEvent::TypingState {
+                    agent_id: agent_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                    is_typing: false,
+                })
+                .ok();
+        }
+        _ => {}
+    }
+}
+
+/// Route an outbound response to the messaging adapter using the pinned target
+/// message for platform routing metadata (thread_ts, channel_id, etc.).
+async fn route_outbound(
+    messaging: &std::sync::Arc<spacebot::messaging::MessagingManager>,
+    target: &spacebot::InboundMessage,
+    response: spacebot::OutboundResponse,
+) {
+    match response {
+        spacebot::OutboundResponse::Status(status) => {
+            if let Err(error) = messaging.send_status(target, status).await {
+                tracing::warn!(%error, "failed to send status update");
+            }
+        }
+        response => {
+            if let Err(error) = messaging.respond(target, response).await {
+                tracing::error!(%error, "failed to send outbound response");
+            }
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -521,8 +579,14 @@ fn cmd_auth(config_path: Option<std::path::PathBuf>, auth_cmd: AuthCommand) -> a
                         } else {
                             eprintln!("Anthropic OAuth: valid (expires in {}m)", expires_min);
                         }
-                        eprintln!("  access token: {}...", &creds.access_token[..20]);
-                        eprintln!("  refresh token: {}...", &creds.refresh_token[..20]);
+                        eprintln!(
+                            "  access token: <redacted> ({} bytes)",
+                            creds.access_token.len()
+                        );
+                        eprintln!(
+                            "  refresh token: <redacted> ({} bytes)",
+                            creds.refresh_token.len()
+                        );
                         eprintln!(
                             "  credentials file: {}",
                             spacebot::auth::credentials_path(&instance_dir).display()
@@ -1587,6 +1651,7 @@ async fn run(
         let mut slack_permissions = None;
         let mut telegram_permissions = None;
         let mut twitch_permissions = None;
+        let mut signal_permissions = None;
         initialize_agents(
             &config,
             &llm_manager,
@@ -1604,6 +1669,7 @@ async fn run(
             &mut slack_permissions,
             &mut telegram_permissions,
             &mut twitch_permissions,
+            &mut signal_permissions,
             agent_links.clone(),
             agent_humans.clone(),
             injection_tx.clone(),
@@ -1622,6 +1688,7 @@ async fn run(
             slack_permissions,
             telegram_permissions,
             twitch_permissions,
+            signal_permissions,
             bindings.clone(),
             Some(messaging_manager.clone()),
             llm_manager.clone(),
@@ -1634,6 +1701,7 @@ async fn run(
             config_path.clone(),
             config.instance_dir.clone(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -1742,7 +1810,7 @@ async fn run(
                     }
 
                     let (response_tx, mut response_rx) =
-                        mpsc::channel::<spacebot::OutboundResponse>(32);
+                        mpsc::channel::<spacebot::RoutedResponse>(32);
                     let event_rx = agent.deps.event_tx.subscribe();
                     let channel_id: spacebot::ChannelId = Arc::from(conversation_id.as_str());
 
@@ -1761,8 +1829,9 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
+                        Some(api_state.live_worker_transcripts.clone()),
                     );
-                    agent
+                    let channel_registration_id = agent
                         .deps
                         .process_control_registry
                         .register_channel(channel.id.clone(), channel.control_handle().downgrade())
@@ -1859,7 +1928,7 @@ async fn run(
                         let scoped_channel_id: spacebot::ChannelId =
                             Arc::from(cleanup_channel_id.as_str());
                         process_control_registry
-                            .unregister_channel(&scoped_channel_id)
+                            .unregister_channel(&scoped_channel_id, channel_registration_id)
                             .await;
                         api_state_for_cleanup
                             .unregister_channel_status(&cleanup_channel_id)
@@ -1869,99 +1938,20 @@ async fn run(
                             .await;
                     });
 
-                    // Outbound response routing for this pre-created channel.
-                    // Since there's no inbound message yet, we create a placeholder.
-                    let latest_message =
-                        Arc::new(tokio::sync::RwLock::new(spacebot::InboundMessage {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            source: "internal".to_string(),
-                            adapter: None,
-                            conversation_id: conversation_id.clone(),
-                            content: spacebot::MessageContent::Text(String::new()),
-                            sender_id: String::new(),
-                            formatted_author: None,
-                            metadata: std::collections::HashMap::new(),
-                            agent_id: Some(agent_id.clone()),
-                            timestamp: chrono::Utc::now(),
-                        }));
-                    let outbound_message = latest_message.clone();
                     let messaging_for_outbound = messaging_manager.clone();
                     let api_event_tx = api_state.event_tx.clone();
                     let sse_agent_id = agent_id.to_string();
                     let sse_channel_id = conversation_id.clone();
                     let outbound_handle = tokio::spawn(async move {
-                        while let Some(response) = response_rx.recv().await {
-                            match &response {
-                                spacebot::OutboundResponse::Text(text) => {
-                                    api_event_tx
-                                        .send(spacebot::api::ApiEvent::OutboundMessage {
-                                            agent_id: sse_agent_id.clone(),
-                                            channel_id: sse_channel_id.clone(),
-                                            text: text.clone(),
-                                        })
-                                        .ok();
-                                }
-                                spacebot::OutboundResponse::RichMessage { text, .. } => {
-                                    api_event_tx
-                                        .send(spacebot::api::ApiEvent::OutboundMessage {
-                                            agent_id: sse_agent_id.clone(),
-                                            channel_id: sse_channel_id.clone(),
-                                            text: text.clone(),
-                                        })
-                                        .ok();
-                                }
-                                spacebot::OutboundResponse::ThreadReply { text, .. } => {
-                                    api_event_tx
-                                        .send(spacebot::api::ApiEvent::OutboundMessage {
-                                            agent_id: sse_agent_id.clone(),
-                                            channel_id: sse_channel_id.clone(),
-                                            text: text.clone(),
-                                        })
-                                        .ok();
-                                }
-                                spacebot::OutboundResponse::Status(
-                                    spacebot::StatusUpdate::Thinking,
-                                ) => {
-                                    api_event_tx
-                                        .send(spacebot::api::ApiEvent::TypingState {
-                                            agent_id: sse_agent_id.clone(),
-                                            channel_id: sse_channel_id.clone(),
-                                            is_typing: true,
-                                        })
-                                        .ok();
-                                }
-                                spacebot::OutboundResponse::Status(
-                                    spacebot::StatusUpdate::StopTyping,
-                                ) => {
-                                    api_event_tx
-                                        .send(spacebot::api::ApiEvent::TypingState {
-                                            agent_id: sse_agent_id.clone(),
-                                            channel_id: sse_channel_id.clone(),
-                                            is_typing: false,
-                                        })
-                                        .ok();
-                                }
-                                _ => {}
-                            }
-                            let current_message = outbound_message.read().await.clone();
-                            match response {
-                                spacebot::OutboundResponse::Status(status) => {
-                                    if let Err(error) = messaging_for_outbound
-                                        .send_status(&current_message, status)
-                                        .await
-                                    {
-                                        tracing::warn!(%error, "failed to send status update");
-                                    }
-                                }
-                                response => {
-                                    if let Err(error) = messaging_for_outbound
-                                        .respond(&current_message, response)
-                                        .await
-                                    {
-                                        tracing::error!(%error, "failed to send outbound response");
-                                    }
-                                }
-                            }
+                        while let Some(routed) = response_rx.recv().await {
+                            let spacebot::RoutedResponse { response, target } = routed;
+                            forward_sse_event(
+                                &api_event_tx,
+                                &sse_agent_id,
+                                &sse_channel_id,
+                                &response,
+                            );
+                            route_outbound(&messaging_for_outbound, &target, response).await;
                         }
                     });
 
@@ -1969,7 +1959,6 @@ async fn run(
                         conversation_id.clone(),
                         ActiveChannel {
                             message_tx: channel_tx,
-                            latest_message,
                             _outbound_handle: outbound_handle,
                         },
                     );
@@ -2026,7 +2015,7 @@ async fn run(
                     };
 
                     // Create outbound response channel
-                    let (response_tx, mut response_rx) = mpsc::channel::<spacebot::OutboundResponse>(32);
+                    let (response_tx, mut response_rx) = mpsc::channel::<spacebot::RoutedResponse>(32);
 
                     // Subscribe to the agent's event bus
                     let event_rx = agent.deps.event_tx.subscribe();
@@ -2048,8 +2037,9 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                         snapshot_store,
+                        Some(api_state.live_worker_transcripts.clone()),
                     );
-                    agent
+                    let channel_registration_id = agent
                         .deps
                         .process_control_registry
                         .register_channel(channel.id.clone(), channel.control_handle().downgrade())
@@ -2105,7 +2095,7 @@ async fn run(
                         let scoped_channel_id: spacebot::ChannelId =
                             Arc::from(cleanup_channel_id.as_str());
                         process_control_registry
-                            .unregister_channel(&scoped_channel_id)
+                            .unregister_channel(&scoped_channel_id, channel_registration_id)
                             .await;
                         api_state_for_cleanup
                             .unregister_channel_status(&cleanup_channel_id)
@@ -2118,84 +2108,24 @@ async fn run(
                     // Spawn outbound response routing: reads from response_rx,
                     // sends to the messaging adapter and forwards to SSE
                     let messaging_for_outbound = messaging_manager.clone();
-                    let latest_message = Arc::new(tokio::sync::RwLock::new(message.clone()));
-                    let outbound_message = latest_message.clone();
                     let outbound_conversation_id = conversation_id.clone();
                     let api_event_tx = api_state.event_tx.clone();
                     let sse_agent_id = agent_id.to_string();
                     let sse_channel_id = conversation_id.clone();
                     let outbound_handle = tokio::spawn(async move {
-                        while let Some(response) = response_rx.recv().await {
-                            // Forward relevant events to SSE clients
-                            match &response {
-                                spacebot::OutboundResponse::Text(text) => {
-                                    api_event_tx.send(spacebot::api::ApiEvent::OutboundMessage {
-                                        agent_id: sse_agent_id.clone(),
-                                        channel_id: sse_channel_id.clone(),
-                                        text: text.clone(),
-                                    }).ok();
-                                }
-                                spacebot::OutboundResponse::RichMessage { text, .. } => {
-                                    api_event_tx.send(spacebot::api::ApiEvent::OutboundMessage {
-                                        agent_id: sse_agent_id.clone(),
-                                        channel_id: sse_channel_id.clone(),
-                                        text: text.clone(),
-                                    }).ok();
-                                }
-                                spacebot::OutboundResponse::ThreadReply { text, .. } => {
-                                    api_event_tx.send(spacebot::api::ApiEvent::OutboundMessage {
-                                        agent_id: sse_agent_id.clone(),
-                                        channel_id: sse_channel_id.clone(),
-                                        text: text.clone(),
-                                    }).ok();
-                                }
-                                spacebot::OutboundResponse::Status(spacebot::StatusUpdate::Thinking) => {
-                                    api_event_tx.send(spacebot::api::ApiEvent::TypingState {
-                                        agent_id: sse_agent_id.clone(),
-                                        channel_id: sse_channel_id.clone(),
-                                        is_typing: true,
-                                    }).ok();
-                                }
-                                spacebot::OutboundResponse::Status(spacebot::StatusUpdate::StopTyping) => {
-                                    api_event_tx.send(spacebot::api::ApiEvent::TypingState {
-                                        agent_id: sse_agent_id.clone(),
-                                        channel_id: sse_channel_id.clone(),
-                                        is_typing: false,
-                                    }).ok();
-                                }
-                                _ => {}
-                            }
-
-                            let current_message = outbound_message.read().await.clone();
-
-                            match response {
-                                spacebot::OutboundResponse::Status(status) => {
-                                    if let Err(error) = messaging_for_outbound
-                                        .send_status(&current_message, status)
-                                        .await
-                                    {
-                                        tracing::warn!(%error, "failed to send status update");
-                                    }
-                                }
-                                response => {
-                                    tracing::info!(
-                                        conversation_id = %outbound_conversation_id,
-                                        "routing outbound response to messaging adapter"
-                                    );
-                                    if let Err(error) = messaging_for_outbound
-                                        .respond(&current_message, response)
-                                        .await
-                                    {
-                                        tracing::error!(%error, "failed to send outbound response");
-                                    }
-                                }
-                            }
+                        while let Some(routed) = response_rx.recv().await {
+                            let spacebot::RoutedResponse { response, target } = routed;
+                            forward_sse_event(&api_event_tx, &sse_agent_id, &sse_channel_id, &response);
+                            route_outbound(&messaging_for_outbound, &target, response).await;
                         }
+                        tracing::debug!(
+                            conversation_id = %outbound_conversation_id,
+                            "outbound response channel closed"
+                        );
                     });
 
                     active_channels.insert(conversation_id.clone(), ActiveChannel {
                         message_tx: channel_tx,
-                        latest_message,
                         _outbound_handle: outbound_handle,
                     });
 
@@ -2208,10 +2138,6 @@ async fn run(
 
                 // Forward the message to the channel
                 if let Some(active) = active_channels.get(&conversation_id) {
-                    // Update the shared message reference so outbound routing
-                    // (typing indicators, reactions) targets this message
-                    *active.latest_message.write().await = message.clone();
-
                     // Emit inbound message to SSE clients
                     let sender_name = message.formatted_author.clone().or_else(|| {
                         message
@@ -2316,6 +2242,7 @@ async fn run(
                                 let mut new_slack_permissions = None;
                                 let mut new_telegram_permissions = None;
                                 let mut new_twitch_permissions = None;
+                                let mut new_signal_permissions = None;
                                 match initialize_agents(
                                     &new_config,
                                     &new_llm_manager,
@@ -2333,6 +2260,7 @@ async fn run(
                                     &mut new_slack_permissions,
                                     &mut new_telegram_permissions,
                                     &mut new_twitch_permissions,
+                                    &mut new_signal_permissions,
                                     agent_links.clone(),
                                     agent_humans.clone(),
                                     injection_tx.clone(),
@@ -2350,6 +2278,7 @@ async fn run(
                                             new_slack_permissions,
                                             new_telegram_permissions,
                                             new_twitch_permissions,
+                                            new_signal_permissions,
                                             bindings.clone(),
                                             Some(messaging_manager.clone()),
                                             new_llm_manager.clone(),
@@ -2472,6 +2401,7 @@ async fn initialize_agents(
     slack_permissions: &mut Option<Arc<ArcSwap<spacebot::config::SlackPermissions>>>,
     telegram_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TelegramPermissions>>>,
     twitch_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TwitchPermissions>>>,
+    signal_permissions: &mut Option<Arc<ArcSwap<spacebot::config::SignalPermissions>>>,
     agent_links: Arc<ArcSwap<Vec<spacebot::links::AgentLink>>>,
     agent_humans: Arc<ArcSwap<Vec<spacebot::config::HumanDef>>>,
     injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
@@ -3167,6 +3097,58 @@ async fn initialize_agents(
                 instance.channels.clone(),
                 instance.trigger_prefix.clone(),
                 perms,
+            );
+            new_messaging_manager.register(adapter).await;
+        }
+    }
+
+    // Shared Signal permissions (hot-reloadable via file watcher)
+    *signal_permissions = config.messaging.signal.as_ref().map(|signal_config| {
+        let perms = spacebot::config::SignalPermissions::from_config(signal_config);
+        Arc::new(ArcSwap::from_pointee(perms))
+    });
+
+    if let Some(signal_config) = &config.messaging.signal
+        && signal_config.enabled
+    {
+        let tmp_dir = config.instance_dir.join("tmp");
+        if !signal_config.http_url.is_empty() && !signal_config.account.is_empty() {
+            let adapter = spacebot::messaging::signal::SignalAdapter::new(
+                "signal",
+                &signal_config.http_url,
+                &signal_config.account,
+                signal_config.ignore_stories,
+                signal_permissions.clone().ok_or_else(|| {
+                    anyhow::anyhow!("signal permissions not initialized when signal is enabled")
+                })?,
+                tmp_dir.clone(),
+            );
+            new_messaging_manager.register(adapter).await;
+        }
+
+        for instance in signal_config
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+        {
+            if instance.http_url.is_empty() || instance.account.is_empty() {
+                tracing::warn!(adapter = %instance.name, "skipping enabled signal instance with missing credentials");
+                continue;
+            }
+            let runtime_key = spacebot::config::binding_runtime_adapter_key(
+                "signal",
+                Some(instance.name.as_str()),
+            );
+            let perms = Arc::new(ArcSwap::from_pointee(
+                spacebot::config::SignalPermissions::from_instance_config(instance),
+            ));
+            let adapter = spacebot::messaging::signal::SignalAdapter::new(
+                runtime_key,
+                &instance.http_url,
+                &instance.account,
+                instance.ignore_stories,
+                perms,
+                tmp_dir.clone(),
             );
             new_messaging_manager.register(adapter).await;
         }

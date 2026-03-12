@@ -40,6 +40,7 @@ pub mod file;
 pub mod install_skill;
 pub mod mcp;
 pub mod memory_delete;
+pub mod memory_persistence_complete;
 pub mod memory_recall;
 pub mod memory_save;
 pub mod project_manage;
@@ -98,6 +99,11 @@ pub use install_skill::{
 pub use mcp::{McpToolAdapter, McpToolError, McpToolOutput};
 pub use memory_delete::{
     MemoryDeleteArgs, MemoryDeleteError, MemoryDeleteOutput, MemoryDeleteTool,
+};
+pub use memory_persistence_complete::{
+    MemoryPersistenceCompleteArgs, MemoryPersistenceCompleteError, MemoryPersistenceCompleteOutput,
+    MemoryPersistenceCompleteTool, MemoryPersistenceContractState,
+    MemoryPersistenceTerminalOutcome,
 };
 pub use memory_recall::{
     MemoryOutput, MemoryRecallArgs, MemoryRecallError, MemoryRecallOutput, MemoryRecallTool,
@@ -169,12 +175,20 @@ use crate::config::{BrowserConfig, RuntimeConfig};
 use crate::memory::MemorySearch;
 use crate::sandbox::Sandbox;
 use crate::tasks::TaskStore;
-use crate::{AgentId, ChannelId, OutboundResponse, ProcessEvent, WorkerId};
+use crate::{AgentId, ChannelId, ProcessEvent, RoutedSender, WorkerId};
 use rig::tool::Tool as _;
 use rig::tool::server::{ToolServer, ToolServerHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
+
+#[derive(Debug, Clone)]
+pub enum BranchToolProfile {
+    Default,
+    MemoryPersistence {
+        contract_state: Arc<MemoryPersistenceContractState>,
+    },
+}
 
 /// Deserialize a `u64` that may arrive as either a JSON number or a JSON string.
 ///
@@ -334,13 +348,15 @@ pub fn should_block_user_visible_text(value: &str) -> bool {
 pub async fn add_channel_tools(
     handle: &ToolServerHandle,
     state: ChannelState,
-    response_tx: mpsc::Sender<OutboundResponse>,
+    response_tx: RoutedSender,
     conversation_id: impl Into<String>,
     skip_flag: SkipFlag,
     replied_flag: RepliedFlag,
     cron_tool: Option<CronTool>,
     send_agent_message_tool: Option<SendAgentMessageTool>,
     allow_direct_reply: bool,
+    current_adapter: Option<String>,
+    slack_thread_ts: Option<&str>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     let conversation_id = conversation_id.into();
 
@@ -378,6 +394,7 @@ pub async fn add_channel_tools(
                 state.channel_store.clone(),
                 state.conversation_logger.clone(),
                 send_message_display_name,
+                current_adapter.clone(),
             ))
             .await?;
     }
@@ -416,7 +433,7 @@ pub async fn add_channel_tools(
     handle.add_tool(ReactTool::new(response_tx.clone())).await?;
     if let Some(cron_tool) = cron_tool {
         let cron_tool = cron_tool.with_default_delivery_target(
-            default_delivery_target_for_conversation(&conversation_id),
+            default_delivery_target_for_conversation(&conversation_id, slack_thread_ts),
         );
         handle.add_tool(cron_tool).await?;
     }
@@ -427,7 +444,10 @@ pub async fn add_channel_tools(
     Ok(())
 }
 
-fn default_delivery_target_for_conversation(conversation_id: &str) -> Option<String> {
+fn default_delivery_target_for_conversation(
+    conversation_id: &str,
+    slack_thread_ts: Option<&str>,
+) -> Option<String> {
     let parsed = crate::messaging::target::parse_delivery_target(conversation_id)?;
     match parsed.adapter.as_str() {
         // Cron channels can't receive broadcast delivery.
@@ -436,6 +456,15 @@ fn default_delivery_target_for_conversation(conversation_id: &str) -> Option<Str
         // adapter is registered as "webchat". Remap so the manager can find it,
         // and pass the full original conversation_id as the target.
         "portal" => Some(format!("webchat:{conversation_id}")),
+        // For Slack, append the originating thread_ts so cron broadcasts land in
+        // the correct thread rather than posting top-level.
+        "slack" => {
+            let base = parsed.to_string();
+            match slack_thread_ts {
+                Some(ts) => Some(format!("{base}#thread:{ts}")),
+                None => Some(base),
+            }
+        }
         _ => Some(parsed.to_string()),
     }
 }
@@ -492,13 +521,19 @@ pub fn create_branch_tool_server(
     conversation_logger: crate::conversation::history::ConversationLogger,
     channel_store: crate::conversation::ChannelStore,
     run_logger: crate::conversation::history::ProcessRunLogger,
+    profile: BranchToolProfile,
 ) -> ToolServerHandle {
+    let mut memory_save = memory_save_with_events(
+        memory_search.clone(),
+        agent_id.clone(),
+        memory_event_tx.clone(),
+    );
+    if let BranchToolProfile::MemoryPersistence { contract_state } = &profile {
+        memory_save = memory_save.with_contract_state(contract_state.clone());
+    }
+
     let mut server = ToolServer::new()
-        .tool(memory_save_with_events(
-            memory_search.clone(),
-            agent_id.clone(),
-            memory_event_tx.clone(),
-        ))
+        .tool(memory_save)
         .tool(MemoryRecallTool::new(memory_search.clone()))
         .tool(MemoryDeleteTool::new(memory_search))
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
@@ -512,6 +547,10 @@ pub fn create_branch_tool_server(
         ))
         .tool(TaskListTool::new(task_store.clone(), agent_id.to_string()))
         .tool(TaskUpdateTool::for_branch(task_store, agent_id.clone()));
+
+    if let BranchToolProfile::MemoryPersistence { contract_state } = profile {
+        server = server.tool(MemoryPersistenceCompleteTool::new(contract_state));
+    }
 
     if let Some(state) = state {
         server = server.tool(SpawnWorkerTool::new(state));
@@ -952,5 +991,88 @@ mod tests {
         // For larger max_bytes=10: can fit "🙂..." (7 bytes)
         assert_eq!(truncate_utf8_ellipsis(text, 10), "🙂...");
         assert!(truncate_output(text, 5).starts_with("🙂"));
+    }
+
+    #[test]
+    fn truncate_cyrillic_does_not_panic() {
+        // Cyrillic chars are 2 bytes each in UTF-8
+        let text = "Привет, мир!"; // "Hello, world!" in Russian
+        // Cutting at byte 5 would land inside 'и' (bytes 4..5) - this must not panic
+        let result = truncate_utf8_ellipsis(text, 5);
+        assert!(!result.is_empty());
+        // "П" (2 bytes) + "..." (3 bytes) = 5, fits exactly
+        assert_eq!(result, "П...");
+
+        let result = truncate_utf8_ellipsis(text, 10);
+        assert!(!result.is_empty());
+        // Should truncate to a valid char boundary and append "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_cjk_does_not_panic() {
+        // CJK chars are 3 bytes each in UTF-8
+        let text = "你好世界测试"; // "Hello world test" in Chinese
+        // Cutting at byte 4 would land inside '好' (bytes 3..5)
+        let result = truncate_utf8_ellipsis(text, 4);
+        assert_eq!(result, "你"); // only 3 bytes fit, no room for "..."
+
+        let result = truncate_utf8_ellipsis(text, 10);
+        assert!(!result.is_empty());
+        // 2 CJK chars (6 bytes) + "..." (3 bytes) = 9 bytes fits in 10
+        assert_eq!(result, "你好...");
+    }
+
+    #[test]
+    fn truncate_emoji_does_not_panic() {
+        // Emoji are 4 bytes each in UTF-8
+        let text = "Hello 😀🎉🚀 World";
+        let result = truncate_utf8_ellipsis(text, 10);
+        assert!(!result.is_empty());
+        // "Hello " (6 bytes) + "😀" won't fit with "..." in 10 bytes
+        // "Hello " (6 bytes) + "..." (3 bytes) = 9 bytes fits
+        assert_eq!(result, "Hello ...");
+
+        // Larger budget
+        let result = truncate_utf8_ellipsis(text, 15);
+        assert!(!result.is_empty());
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_mixed_multibyte_content() {
+        // Mix of ASCII, Cyrillic (2-byte), CJK (3-byte), and emoji (4-byte)
+        let text = "Hi Привет 你好 😀";
+        let result = truncate_utf8_ellipsis(text, 20);
+        assert!(!result.is_empty());
+        assert!(result.ends_with("..."));
+        // Verify it's valid UTF-8 by iterating chars
+        assert!(result.chars().count() > 0);
+    }
+
+    #[test]
+    fn truncate_output_multibyte_does_not_panic() {
+        let cyrillic = "Привет, мир! Это тестовая строка для проверки.";
+        let result = truncate_output(cyrillic, 15);
+        assert!(!result.is_empty());
+
+        let cjk = "你好世界，这是一个测试字符串。";
+        let result = truncate_output(cjk, 10);
+        assert!(!result.is_empty());
+
+        let emoji = "🎉🚀😀🌍💻🔥";
+        let result = truncate_output(emoji, 6);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn truncate_at_exact_char_boundary_works() {
+        let text = "абв"; // 3 Cyrillic chars, 6 bytes total
+        // Exactly at a char boundary (4 bytes = 2 chars)
+        let result = truncate_utf8_ellipsis(text, 6);
+        assert_eq!(result, "абв"); // fits entirely
+
+        let result = truncate_utf8_ellipsis(text, 7);
+        assert_eq!(result, "абв"); // also fits, no truncation needed
     }
 }
