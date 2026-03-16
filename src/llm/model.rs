@@ -1407,11 +1407,12 @@ fn convert_messages_to_openai(messages: &OneOrMany<Message>) -> Vec<serde_json::
                 }
 
                 let mut msg = serde_json::json!({"role": "assistant"});
-                if !text_parts.is_empty() {
-                    msg["content"] = serde_json::json!(text_parts.join("\n"));
-                } else if !tool_calls.is_empty() || saw_reasoning {
-                    msg["content"] = serde_json::Value::Null;
-                }
+                // Always set content — Ollama Cloud rejects messages with nil content type
+                msg["content"] = serde_json::json!(if text_parts.is_empty() {
+                    String::new()
+                } else {
+                    text_parts.join("\n")
+                });
                 if saw_reasoning {
                     msg["reasoning_content"] = serde_json::json!(reasoning_parts.join("\n"));
                 }
@@ -3181,7 +3182,7 @@ mod tests {
         let converted = convert_messages_to_openai(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0]["role"], "assistant");
-        assert!(converted[0]["content"].is_null());
+        assert_eq!(converted[0]["content"], "");
         assert_eq!(converted[0]["reasoning_content"], "step one\nstep two");
         assert_eq!(converted[0]["tool_calls"][0]["function"]["name"], "file");
         assert_eq!(
@@ -3226,7 +3227,7 @@ mod tests {
 
         let converted = convert_messages_to_openai(&messages);
         assert_eq!(converted.len(), 1);
-        assert!(converted[0]["content"].is_null());
+        assert_eq!(converted[0]["content"], "");
         assert_eq!(converted[0]["reasoning_content"], "");
     }
 
